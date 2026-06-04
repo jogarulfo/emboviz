@@ -80,6 +80,9 @@ class ACTAdapter(VLAModel):
         ),
     }
 
+    # ACT's ResNet backbone downsamples image features by stride 32.
+    _VISUAL_BACKBONE_STRIDE = 32
+
     def __init__(
         self,
         checkpoint: str,
@@ -288,6 +291,57 @@ class ACTAdapter(VLAModel):
             )
         return arr[0]   # (chunk_size, action_dim)
 
+    def _camera_token_layout(
+        self,
+        frame: dict[str, Any],
+        batch: dict[str, Any],
+        backbone_hw: Optional[list[tuple[int, int]]] = None,
+    ) -> dict[str, tuple[int, int, int]]:
+        """Per-camera visual-token layout as {model_cam: (gh, gw, n_tokens)}.
+
+        Uses the ACT model-camera tensors after preprocessing when available,
+        and falls back to raw frame tensors. This supports mixed camera
+        resolutions while preserving ACT's fixed backbone stride.
+        """
+        layout: dict[str, tuple[int, int, int]] = {}
+        stride = int(self._VISUAL_BACKBONE_STRIDE)
+
+        if backbone_hw is not None and len(backbone_hw) == len(self._present_model_cameras):
+            for model_cam, (gh, gw) in zip(self._present_model_cameras, backbone_hw, strict=True):
+                gh_i = int(gh)
+                gw_i = int(gw)
+                layout[model_cam] = (gh_i, gw_i, gh_i * gw_i)
+            return layout
+
+        for model_cam in self._present_model_cameras:
+            h: Optional[int] = None
+            w: Optional[int] = None
+
+            t = batch.get(model_cam) if isinstance(batch, dict) else None
+            if t is not None and getattr(t, "ndim", 0) >= 4:
+                h = int(t.shape[-2])
+                w = int(t.shape[-1])
+            else:
+                role = self._modelcam_to_role[model_cam]
+                input_key = self.camera_mapping[role]
+                t = frame.get(input_key)
+                if t is not None and getattr(t, "ndim", 0) >= 3:
+                    h = int(t.shape[-2])
+                    w = int(t.shape[-1])
+
+            if h is None or w is None:
+                raise RuntimeError(
+                    "ACTAdapter.extract_attention: unable to infer image "
+                    f"shape for camera '{model_cam}' from preprocessed batch "
+                    "or raw frame."
+                )
+
+            gh = max(1, h // stride)
+            gw = max(1, w // stride)
+            layout[model_cam] = (gh, gw, gh * gw)
+
+        return layout
+
     def predict(self, scene: Scene) -> ActionResult:
         chunk = self._action_chunk(scene)
         action = chunk[0]
@@ -322,13 +376,12 @@ class ACTAdapter(VLAModel):
         model = self._policy.model
         frame = self._build_frame(scene)
         batch = self._pre(frame)
-
-        feat_hw: dict[str, tuple[int, int]] = {}
         captured: list = []
+        backbone_hw: list[tuple[int, int]] = []
 
         def backbone_hook(_module, _inp, out):
             fm = out["feature_map"] if isinstance(out, dict) else out
-            feat_hw["hw"] = (int(fm.shape[-2]), int(fm.shape[-1]))
+            backbone_hw.append((int(fm.shape[-2]), int(fm.shape[-1])))
 
         bb_handle = model.backbone.register_forward_hook(backbone_hook)
         patched: list = []
@@ -360,30 +413,35 @@ class ACTAdapter(VLAModel):
             bb_handle.remove()
             for mha, original in patched:
                 mha.forward = original
-
-        if "hw" not in feat_hw:
-            raise RuntimeError(
-                "ACTAdapter.extract_attention: the ResNet backbone hook did "
-                "not fire; lerobot's ACT forward path may have changed."
-            )
         if len(captured) != self._n_decoder_layers:
             raise RuntimeError(
                 "ACTAdapter.extract_attention: captured "
                 f"{len(captured)} cross-attention layers but the config "
                 f"declares {self._n_decoder_layers}."
             )
+        if backbone_hw and len(backbone_hw) != len(self._present_model_cameras):
+            raise RuntimeError(
+                "ACTAdapter.extract_attention: captured "
+                f"{len(backbone_hw)} backbone feature maps but expected "
+                f"{len(self._present_model_cameras)} cameras."
+            )
 
-        h, w = feat_hw["hw"]
-        tokens_per_cam = h * w
-        n_cams = len(self._present_model_cameras)
+        token_layout = self._camera_token_layout(
+            frame, batch, backbone_hw=backbone_hw or None,
+        )
         encoder_len = int(captured[0].shape[-1])
-        expected = self._n_non_image_tokens + n_cams * tokens_per_cam
+        expected = self._n_non_image_tokens + sum(
+            n for _h, _w, n in token_layout.values()
+        )
         if encoder_len != expected:
+            details = ", ".join(
+                f"{self._modelcam_to_role[cam]}:{gh}x{gw}={n}"
+                for cam, (gh, gw, n) in token_layout.items()
+            )
             raise RuntimeError(
                 "ACTAdapter.extract_attention: encoder length "
                 f"{encoder_len} != expected {expected} "
-                f"({self._n_non_image_tokens} non-image + {n_cams} cameras x "
-                f"{tokens_per_cam} tokens)."
+                f"({self._n_non_image_tokens} non-image + {details})."
             )
 
         # weights (L, H, encoder_len) from the first action query's row.
@@ -405,9 +463,25 @@ class ACTAdapter(VLAModel):
         cursor = self._n_non_image_tokens
         for model_cam in self._present_model_cameras:
             role = self._modelcam_to_role[model_cam]
-            image_token_ranges[role] = [(cursor, cursor + tokens_per_cam)]
-            image_grid_shapes[role] = (h, w)
-            cursor += tokens_per_cam
+            gh, gw, n = token_layout[model_cam]
+            image_token_ranges[role] = [(cursor, cursor + n)]
+            image_grid_shapes[role] = (gh, gw)
+            cursor += n
+
+        if cursor != encoder_len:
+            raise RuntimeError(
+                "ACTAdapter.extract_attention: computed camera token slices "
+                f"end at {cursor}, but encoder length is {encoder_len}."
+            )
+
+        role_feature_grids = {
+            self._modelcam_to_role[cam]: [gh, gw]
+            for cam, (gh, gw, _n) in token_layout.items()
+        }
+        role_token_counts = {
+            self._modelcam_to_role[cam]: n
+            for cam, (_gh, _gw, n) in token_layout.items()
+        }
 
         return AttentionMaps(
             weights=weights,
@@ -419,7 +493,8 @@ class ACTAdapter(VLAModel):
                 "attention_profile": self.ATTENTION_PROFILE,
                 "n_decoder_layers": self._n_decoder_layers,
                 "n_heads": self._n_heads,
-                "feature_grid": [h, w],
+                "feature_grids": role_feature_grids,
+                "tokens_per_camera": role_token_counts,
                 "query_token": "first action query (decoder)",
                 "attention_source": (
                     "ACT decoder cross-attention: action query -> encoder "

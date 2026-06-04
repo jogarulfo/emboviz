@@ -8,18 +8,21 @@
 model:
   adapter: act
   kwargs:
-    checkpoint: your-org/your-act-checkpoint    # <-- replace with YOUR ACT policy (HF repo id or local dir)
+    checkpoint: jogarulfop/policy_2026-05-29_shakeitup_dragonfly    # <-- replace with YOUR ACT policy (HF repo id or local dir)
     camera_mapping:                             # camera role -> the checkpoint's image-feature key
       primary: observation.images.top
       wrist:   observation.images.wrist
+      spectro: observation.images.left_tactile_spectrogram
+
 
 dataset:
   format: lerobot
-  path: your-org/your-act-dataset               # <-- replace with YOUR dataset (HF repo id or local dir)
+  path: jogarulfop/rollout_eval_act_2026-05-29_shakeitup_dragonfly_checkpoint_40_000               # <-- replace with YOUR dataset (HF repo id or local dir)
 
   cameras:                                      # camera role -> this dataset's image key
     primary: observation.images.top
     wrist:   observation.images.wrist
+    spectro: observation.images.left_tactile_spectrogram
 
   state:
     key: observation.state
@@ -29,7 +32,7 @@ dataset:
     key: action
 
   gripper:
-    source: 6
+    source: 5
     kind: parallel_jaw
     units: unit
     range: [0.0, 1.0]
@@ -46,6 +49,7 @@ analysis:
   # memorization is omitted by default: it needs SAM 3, a GATED model that
   # requires an HF token (`uv run hf auth login`). Add `memorization` to the
   # list once your token is set.
+  # requires an HF token (`uv run hf auth login`). Add `memorization` to the
   diagnostics: [modality, sensitivity, attention, chunk]
 
   # Used only by the memorization diagnostic (when added above):
